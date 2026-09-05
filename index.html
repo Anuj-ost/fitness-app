@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Phase 1 — Pose Acquisition Console</title>
+<meta name="description" content="On-device body pose tracking console using MediaPipe — real-time skeleton overlay, joint angles, and confidence telemetry." />
+<script src="https://www.youtube.com/iframe_api"></script>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<div class="app">
+  <div class="header">
+    <div>
+      <h1><span class="phase-tag">PHASE 01</span> — Camera Acquisition &amp; Body Position Tracking</h1>
+      <p class="sub">On-device pose landmarking · @mediapipe/tasks-vision · nothing leaves this browser tab</p>
+    </div>
+    <div class="header-badges">
+      <span class="shortcut-hint"><kbd>Space</kbd> toggle · <kbd>F</kbd> fullscreen · <kbd>S</kbd> snap</span>
+      <div class="privacy-badge">● ON-DEVICE — NO UPLOAD</div>
+    </div>
+  </div>
+
+  <div class="left-col">
+    <div class="stage-grid" id="stageGrid">
+      <div class="stage" id="stage">
+        <div class="reticle" id="reticle"></div>
+        <video id="video" playsinline autoplay muted></video>
+        <video id="captureVideo" playsinline autoplay muted style="position:absolute; opacity:0; pointer-events:none; width:10px; height:10px;"></video>
+        <canvas id="overlay"></canvas>
+
+        <!-- Loading overlay -->
+        <div class="loading-overlay" id="loadingOverlay">
+          <div class="spinner"></div>
+          <div class="loading-text" id="loadingText">Downloading pose model…</div>
+        </div>
+
+        <!-- Calibration overlay -->
+        <div class="calibration-overlay" id="calibrationOverlay" style="display:none;">
+          <div class="cal-status" id="calStatusText">Calibrating...</div>
+          <div class="cal-bar"><div class="cal-bar-fill" id="calBarFill"></div></div>
+        </div>
+
+        <div class="stage-empty" id="stageEmpty">
+          <div class="icon">◎</div>
+          Camera is off.<br/>Press <strong>Start Camera</strong> or hit <kbd>Space</kbd> to begin pose acquisition.
+        </div>
+
+        <div class="stage-badge" id="stageBadge" style="display:none;">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">IDLE</span>
+        </div>
+        <div class="fps-badge" id="fpsBadge" style="display:none;">-- FPS</div>
+
+        <!-- Angle chips overlay -->
+        <div class="angle-overlay" id="angleOverlay" style="display:none;"></div>
+      </div>
+
+      <!-- Reference Video Viewport (Right panel for side-by-side mode) -->
+      <div class="ref-stage" id="refStage" style="display:none;">
+        <div class="stage-badge">
+          <span class="dot ready"></span>
+          <span>REFERENCE VIDEO (1x)</span>
+        </div>
+        <div class="yt-player-container" id="ytPlayerContainer" style="display:none;">
+           <div id="ytPlayer"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="controls-left">
+        <button class="primary" id="startBtn">▶ Start Camera</button>
+        <button class="stop" id="stopBtn" disabled>■ Stop</button>
+        <button class="secondary" id="recalBtn" style="display:none;">⟳ Recalibrate</button>
+        <select id="cameraSelect" title="Select camera">
+          <option value="">Default Camera</option>
+        </select>
+      </div>
+      <div class="controls-right">
+        <button class="icon-btn" id="snapBtn" title="Screenshot (S)" disabled>📷</button>
+        <button class="icon-btn" id="fsBtn" title="Fullscreen (F)">⛶</button>
+      </div>
+    </div>
+
+    <div class="load-bar" id="loadBar"><div class="load-bar-fill" id="loadBarFill"></div></div>
+    <div class="error-banner" id="errorBanner"></div>
+
+    <!-- YouTube Reference Extraction -->
+    <div class="yt-panel" id="ytPanel">
+      <div class="yt-header">
+        <h2>Reference Video Extraction</h2>
+      </div>
+      <div class="yt-row">
+        <input type="text" id="ytUrl" placeholder="YouTube URL (e.g., https://www.youtube.com/watch?v=...)" />
+        <button class="secondary" id="ytLoadBtn">Load Video</button>
+      </div>
+      <div class="yt-instructions" id="ytInstructions" style="display:none;">
+        <p class="warning">⚠️ Close any ads before extracting!</p>
+        <p>When prompted, share <strong>This Tab</strong>.</p>
+        <div class="yt-actions">
+          <button class="primary" id="ytExtractBtn">▶ Extract Keypoints</button>
+          <button class="stop" id="ytStopBtn" disabled>■ Stop</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel-col">
+    <!-- System Status -->
+    <div class="panel" id="panelStatus">
+      <h2><span class="section-icon">⚡</span> System Status</h2>
+      <div class="metric-row"><span class="label">Model</span><span class="value" id="mModel">pose_landmarker_lite</span></div>
+      <div class="metric-row"><span class="label">Delegate</span><span class="value" id="mDelegate">—</span></div>
+      <div class="metric-row"><span class="label">Load state</span><span class="value" id="mLoad">not loaded</span></div>
+      <div class="metric-row"><span class="label">Resolution</span><span class="value" id="mRes">—</span></div>
+      <div class="metric-row"><span class="label">Inference FPS</span><span class="value accent" id="mFps">—</span></div>
+      <div class="metric-row"><span class="label">Landmarks tracked</span><span class="value" id="mCount">0 / 33</span></div>
+    </div>
+
+    <!-- Camera Calibration -->
+    <div class="panel" id="panelCalibration">
+      <h2><span class="section-icon">📐</span> Camera Calibration</h2>
+      <div class="metric-row"><span class="label">Status</span><span class="value" id="cStatus">Pending</span></div>
+      <div class="metric-row"><span class="label">Pitch Offset</span><span class="value" id="cPitch">—</span></div>
+      <div class="metric-row"><span class="label">Scale Factor</span><span class="value" id="cScale">—</span></div>
+    </div>
+
+    <!-- Reference Extraction Telemetry -->
+    <div class="panel" id="panelExtraction">
+      <h2><span class="section-icon">🎞️</span> Reference Extraction</h2>
+      <div class="metric-row"><span class="label">Status</span><span class="value" id="eStatus">Idle</span></div>
+      <div class="metric-row"><span class="label">Sequence Time</span><span class="value" id="eTime">0.0s</span></div>
+      <div class="metric-row"><span class="label">Frames Stored</span><span class="value" id="eFrames">0</span></div>
+    </div>
+
+    <!-- DTW Alignment & Form Deviation -->
+    <div class="panel" id="panelAlignment">
+      <h2><span class="section-icon">🔄</span> DTW Form Alignment</h2>
+      <div class="metric-row"><span class="label">Status</span><span class="value" id="dStatus">Idle</span></div>
+      <div class="metric-row"><span class="label">Aggregate RMSE</span><span class="value accent" id="dRmse">—</span></div>
+      <div class="metric-row"><span class="label">Matched Ref Time</span><span class="value" id="dMatchTime">—</span></div>
+
+      <div class="angles-grid" id="devGrid">
+        <div class="angle-card dev-card"><div class="a-label">L Elbow Dev</div><div class="a-value" id="dLElbow">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">R Elbow Dev</div><div class="a-value" id="dRElbow">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">L Knee Dev</div><div class="a-value" id="dLKnee">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">R Knee Dev</div><div class="a-value" id="dRKnee">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">L Shoulder Dev</div><div class="a-value" id="dLShoulder">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">R Shoulder Dev</div><div class="a-value" id="dRShoulder">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">L Hip Dev</div><div class="a-value" id="dLHip">—°</div></div>
+        <div class="angle-card dev-card"><div class="a-label">R Hip Dev</div><div class="a-value" id="dRHip">—°</div></div>
+      </div>
+    </div>
+
+    <!-- Confidence Gauge + Stability -->
+    <div class="panel" id="panelConfidence">
+      <h2><span class="section-icon">◉</span> Body Tracking Quality</h2>
+      <div class="gauge-wrap">
+        <div class="gauge-ring">
+          <svg viewBox="0 0 62 62">
+            <circle class="track" cx="31" cy="31" r="28"/>
+            <circle class="fill" id="gaugeCircle" cx="31" cy="31" r="28"/>
+          </svg>
+          <div class="gauge-pct" id="gaugePct">—</div>
+        </div>
+        <div class="gauge-info">
+          <span class="gauge-label" id="gaugeLabel">Overall Confidence</span>
+          <span id="gaugeDesc">Aggregate visibility score across all 33 landmarks</span>
+        </div>
+      </div>
+      <div class="metric-row"><span class="label">Pose Stability</span><span class="value" id="mStability">—</span></div>
+      <div class="stability-bar"><div class="stability-fill" id="stabilityFill"></div></div>
+    </div>
+
+    <!-- Joint Angles -->
+    <div class="panel" id="panelAngles">
+      <h2><span class="section-icon">📐</span> Joint Angles</h2>
+      <div class="angles-grid" id="anglesGrid">
+        <div class="angle-card"><div class="a-label">L Elbow</div><div class="a-value" id="aLElbow">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">R Elbow</div><div class="a-value" id="aRElbow">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">L Knee</div><div class="a-value" id="aLKnee">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">R Knee</div><div class="a-value" id="aRKnee">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">L Shoulder</div><div class="a-value" id="aLShoulder">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">R Shoulder</div><div class="a-value" id="aRShoulder">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">L Hip</div><div class="a-value" id="aLHip">—<span>°</span></div></div>
+        <div class="angle-card"><div class="a-label">R Hip</div><div class="a-value" id="aRHip">—<span>°</span></div></div>
+      </div>
+    </div>
+
+    <!-- Keypoint Confidence -->
+    <div class="panel" id="panelKeypoints">
+      <h2><span class="section-icon">🦴</span> Keypoint Confidence</h2>
+      <div class="landmark-scroll" id="landmarkScroll">
+        <p class="empty-note">Landmark visibility scores will appear here once tracking starts. This is the raw signal Phase 2 (calibration) and Phase 4 (DTW alignment) will consume downstream.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer-note">Scope: camera init + landmark extraction + joint angles + calibration. No DTW or velocity logic runs in this build.</div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
