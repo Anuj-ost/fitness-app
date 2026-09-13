@@ -119,12 +119,16 @@ Core pipeline (6 phases total):
   downloading videos, but doesn't make this explicitly ToS-compliant. This
   is a documented, accepted tradeoff for this project, not something to
   "fix."
-- **Intermittent inference FPS drops.** Inference FPS has been observed to
-  intermittently drop to 2–3 (from a normal 15–23) under conditions not yet
-  fully isolated — confirmed NOT caused by lighting. Root cause not
-  resolved; deprioritized as out of scope for this project's timeline. If
-  this resurfaces as a significant problem, revisit with a Performance-tab
-  recording captured during the actual drop, not during normal operation.
+- **Inference FPS variability (10–15, with occasional drops lower).**
+  Pipeline round-trip latency (camera capture → Worker inference → result)
+  measured consistently at 48–59ms across multiple sessions — well within
+  real-time interactive thresholds (<100ms). Inference FPS has been observed
+  to vary between 10–15 (and occasionally drop lower per the earlier note)
+  — but pipeline latency itself stays flat regardless of FPS variation,
+  indicating the bottleneck is in frame capture/scheduling cadence
+  (`requestVideoFrameCallback` / `createImageBitmap` timing), not
+  per-frame inference cost. Not further investigated — deprioritized as
+  out of scope, per earlier decision.
 - **Facial landmark hallucination when face is out of frame.** Facial
   landmarks (indices 0–10) can occasionally render at incorrect positions
   (e.g. on the torso) when the face is fully out of frame or turned away —

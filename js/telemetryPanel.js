@@ -102,7 +102,42 @@ export class TelemetryPanel {
   setFps(fps){
     this.dom.mFps.textContent = fps;
     this.dom.fpsBadge.textContent = fps + " FPS";
+    this._currentFps = fps; // TEMP DEBUG — cached for budget calc
   }
+
+  // ---- TEMP DEBUG — Pipeline latency meter (remove after verification) ----
+
+  /**
+   * Update the rolling-average pipeline latency display.
+   * @param {number} latencyMs — single frame round-trip time
+   */
+  pushPipelineLatency(latencyMs){
+    if (!this._latencyRing) this._latencyRing = [];
+    this._latencyRing.push(latencyMs);
+    if (this._latencyRing.length > 30) this._latencyRing.shift();
+
+    const avg = this._latencyRing.reduce((s, v) => s + v, 0) / this._latencyRing.length;
+    const rounded = Math.round(avg);
+
+    if (this.dom.mPipeLatency){
+      this.dom.mPipeLatency.textContent = `${rounded}ms avg`;
+    }
+
+    if (this.dom.mPipeBudget){
+      const fps = this._currentFps || 0;
+      if (fps > 0){
+        const budgetMs = 1000 / fps;
+        const pct = Math.round((avg / budgetMs) * 100);
+        this.dom.mPipeBudget.textContent = `${pct}% of ${Math.round(budgetMs)}ms`;
+        // Color-code: green < 60%, amber 60-90%, red > 90%
+        this.dom.mPipeBudget.className = "value " + (pct < 60 ? "good" : pct < 90 ? "warn" : "");
+      } else {
+        this.dom.mPipeBudget.textContent = "—";
+        this.dom.mPipeBudget.className = "value";
+      }
+    }
+  }
+  // ---- END TEMP DEBUG ----
 
   setStatus(text, kind){
     this.dom.statusText.textContent = text;
@@ -245,6 +280,41 @@ export class TelemetryPanel {
       return;
     }
 
+    if (res.status === "PAUSED") {
+      const reason = res.pauseReason === "POOR_MATCH" ? "Paused (Occlusion)" : "Paused (Resting)";
+      this.setDtwStatus(reason);
+      if (this.dom.dStatus) this.dom.dStatus.className = "value warn";
+      if (this.dom.dRmse) this.dom.dRmse.textContent = res.aggregateRmse !== null ? `${res.aggregateRmse}°` : "—";
+      
+      try {
+        if (this.dom.dMatchTime) {
+          const t = res.matchedRefTime;
+          this.dom.dMatchTime.textContent = (t !== undefined && t !== null && !isNaN(t)) ? `${(t / 1000).toFixed(1)}s` : "—";
+        }
+      } catch (e) {
+        console.warn("Failed to format matchedRefTime:", e);
+      }
+
+      this._updateJointDeviations(res.jointDeviations);
+      return;
+    }
+
+    if (res.status === "REF_GAP") {
+      this.setDtwStatus("Ref Gap");
+      if (this.dom.dStatus) this.dom.dStatus.className = "value warn";
+      if (this.dom.dRmse) this.dom.dRmse.textContent = "—";
+      try {
+        if (this.dom.dMatchTime) {
+          const t = res.matchedRefTime;
+          this.dom.dMatchTime.textContent = (t !== undefined && t !== null && !isNaN(t)) ? `${(t / 1000).toFixed(1)}s` : "—";
+        }
+      } catch (e) {
+        console.warn("Failed to format matchedRefTime:", e);
+      }
+      this._updateJointDeviations({});
+      return;
+    }
+
     if (res.status === "OK") {
       this.setDtwStatus("Active");
       if (this.dom.dRmse) this.dom.dRmse.textContent = res.aggregateRmse !== null ? `${res.aggregateRmse}°` : "—";
@@ -377,6 +447,12 @@ export class TelemetryPanel {
     this.dom.stabilityFill.style.width = "0%";
     this._recentLandmarks = [];
     this._landmarkNodes = false;
+
+    // TEMP DEBUG — reset pipeline latency meter
+    this._latencyRing = [];
+    this._currentFps = 0;
+    if (this.dom.mPipeLatency) this.dom.mPipeLatency.textContent = "—";
+    if (this.dom.mPipeBudget) { this.dom.mPipeBudget.textContent = "—"; this.dom.mPipeBudget.className = "value"; }
     
     this.setCalibrationResult(null);
     this.showCalibrationOverlay(false);

@@ -17,10 +17,12 @@ import { PoseDetector } from "./poseDetector.js";
 import { drawSkeleton, clearCanvas } from "./skeletonRenderer.js";
 import { TelemetryPanel } from "./telemetryPanel.js";
 import { JOINT_ANGLES } from "./constants.js";
+import { computeAllJointAngles } from "./angles.js"; // TEMP DEBUG — used by export
 import { CalibrationSession } from "./calibration.js";
 import { ReferenceExtractor } from "./referenceExtractor.js";
 import { DTWAligner } from "./dtwAligner.js";
 import { LandmarkFilter } from "./oneEuroFilter.js";
+import { downloadJson } from "./downloadUtil.js"; // TEMP DEBUG — shared download helper
 
 // ---- DOM references ----
 const video    = document.getElementById("video");
@@ -49,6 +51,8 @@ const ytLoadBtn     = document.getElementById("ytLoadBtn");
 const ytExtractBtn  = document.getElementById("ytExtractBtn");
 const ytStopBtn     = document.getElementById("ytStopBtn");
 const ytInstructions = document.getElementById("ytInstructions");
+const exportRefBtn  = document.getElementById("exportRefBtn"); // TEMP DEBUG
+const exportDtwBtn  = document.getElementById("exportDtwBtn"); // TEMP DEBUG
 
 const telemetry = new TelemetryPanel({
   mModel:         document.getElementById("mModel"),
@@ -87,6 +91,9 @@ const telemetry = new TelemetryPanel({
   dStatus:        document.getElementById("dStatus"),
   dRmse:          document.getElementById("dRmse"),
   dMatchTime:     document.getElementById("dMatchTime"),
+  // TEMP DEBUG — pipeline latency meter
+  mPipeLatency:   document.getElementById("mPipeLatency"),
+  mPipeBudget:    document.getElementById("mPipeBudget"),
 });
 
 // ---- App instances ----
@@ -96,8 +103,35 @@ const extractor = new ReferenceExtractor(detector, telemetry);
 const dtwAligner = new DTWAligner();
 const landmarkFilter = new LandmarkFilter();
 
+let isVideoPaused = false;
+
 dtwAligner.onAlignmentUpdate = (res) => {
   telemetry.updateAlignmentResults(res);
+  
+  if (isPassivePlaying && extractor && extractor.player) {
+    try {
+      if (res.status === "PAUSED") {
+        if (!isVideoPaused && extractor.player.pauseVideo) {
+          extractor.player.pauseVideo();
+          isVideoPaused = true;
+        }
+      } else if (res.status === "OK" || res.status === "REF_GAP") {
+        if (isVideoPaused && extractor.player.playVideo) {
+          extractor.player.playVideo();
+          isVideoPaused = false;
+        }
+      }
+    } catch(e) {}
+  }
+};
+
+dtwAligner.onCaptureGapsDetected = (gaps) => {
+  const totalGapSec = gaps.reduce((s, g) => s + g.durationMs, 0) / 1000;
+  const msg = gaps.length === 1
+    ? `⚠️ Reference has a ${totalGapSec.toFixed(1)}s capture gap (${(gaps[0].startMs / 1000).toFixed(1)}s–${(gaps[0].endMs / 1000).toFixed(1)}s)`
+    : `⚠️ Reference has ${gaps.length} capture gaps (${totalGapSec.toFixed(1)}s total missing)`;
+  console.warn(msg, gaps);
+  showToast(msg, 4000);
 };
 
 extractor.onPlayerError = (err) => {
@@ -116,6 +150,9 @@ let frameTimes = [];
 let calibrationTransform = null;
 let activeCalibration = null;
 let referenceSequence = null;
+
+// TEMP DEBUG — pipeline latency tracking
+const _frameSendTimes = new Map();  // timestamp → performance.now() at send
 
 let passivePollInterval = null;
 let isPassivePlaying    = false;
@@ -145,6 +182,7 @@ function startPassivePlayback() {
   if (!extractor || !extractor.player) return;
 
   isPassivePlaying = true;
+  isVideoPaused = false;
   try {
     if (extractor.player.seekTo) extractor.player.seekTo(0, true);
     if (extractor.player.setPlaybackRate) extractor.player.setPlaybackRate(1);
@@ -178,6 +216,7 @@ function startPassivePlayback() {
 
 function stopPassivePlayback() {
   isPassivePlaying = false;
+  isVideoPaused = false;
   if (passivePollInterval) {
     clearInterval(passivePollInterval);
     passivePollInterval = null;
@@ -228,6 +267,13 @@ detector.onResult = (landmarks, timestamp, meta) => {
   }
 
   if (!running || !landmarks) return;
+
+  // TEMP DEBUG — compute pipeline round-trip latency
+  if (_frameSendTimes.has(timestamp)){
+    const sendT = _frameSendTimes.get(timestamp);
+    _frameSendTimes.delete(timestamp);
+    telemetry.pushPipelineLatency(performance.now() - sendT);
+  }
 
   // Smooth high-frequency jitter via 1€ filter (Casiez et al. 2012)
   // before any downstream consumer sees the landmarks.
@@ -284,7 +330,9 @@ async function processFrame(){
   if (!paused && video.readyState >= 2 && detector.isReady()){
     try {
       const bitmap = await createImageBitmap(video);
-      detector.sendFrame(bitmap, performance.now()); // zero-copy transfer; pass timestamp for VIDEO mode
+      const sendTs = performance.now();
+      const sent = detector.sendFrame(bitmap, sendTs); // zero-copy transfer; pass timestamp for VIDEO mode
+      if (sent) _frameSendTimes.set(sendTs, sendTs); // TEMP DEBUG — record send wall-time only if dispatched
     } catch (e) {
       // createImageBitmap can fail if video is not ready yet — silently skip
     }
@@ -375,6 +423,7 @@ async function startCamera(){
       ytPlayerContainer.style.display = "block";
       dtwAligner.start();
       telemetry.setDtwStatus("Aligning...");
+      exportDtwBtn.disabled = false; // TEMP DEBUG
       startPassivePlayback();
     } else {
       stageGrid.classList.remove("dual-stage");
@@ -406,6 +455,7 @@ async function stopCamera(){
   try {
     running = false;
     landmarkFilter.reset();
+    _frameSendTimes.clear(); // TEMP DEBUG — discard pending latency entries
     if (vfcId && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(vfcId);
 
     await camera.stop();
@@ -428,6 +478,7 @@ async function stopCamera(){
     if (dtwAligner.isAligning) {
       dtwAligner.stop();
       telemetry.setDtwStatus("Idle");
+      exportDtwBtn.disabled = true; // TEMP DEBUG
     }
 
     stopPassivePlayback();
@@ -548,6 +599,7 @@ ytExtractBtn.addEventListener("click", async () => {
       ytPlayerContainer.style.display = "block";
       telemetry.setDtwStatus("Ready (Reference Loaded)");
       showToast(`Extraction complete: ${sequence.length} frames`);
+      exportRefBtn.disabled = false; // TEMP DEBUG
     }, (err) => {
       showError(err.message);
       ytExtractBtn.disabled = false;
@@ -565,6 +617,46 @@ ytExtractBtn.addEventListener("click", async () => {
 ytStopBtn.addEventListener("click", () => {
   extractor.stopExtraction("Extraction stopped by user.");
 });
+
+// ---- TEMP DEBUG — Export R(t) as simplified JSON ----
+exportRefBtn.addEventListener("click", () => {
+  if (!referenceSequence || referenceSequence.length === 0) {
+    showError("No reference data to export.");
+    return;
+  }
+
+  const simplified = referenceSequence.map((frame, idx) => {
+    const angles = computeAllJointAngles(frame.landmarks);
+    const angleObj = {};
+    for (const [id, data] of Object.entries(angles)) {
+      // Strip the 'a' prefix (aLElbow → LElbow) for readability
+      const name = id.substring(1);
+      angleObj[name] = data.isValid ? data.angle : null;
+    }
+    return {
+      frame: idx,
+      timeMs: Math.round(frame.timeMs * 10) / 10,
+      timeSec: Math.round(frame.timeMs / 100) / 10,
+      angles: angleObj
+    };
+  });
+
+  downloadJson(`ref-data-${Date.now()}.json`, simplified);
+  showToast(`Exported ${simplified.length} frames`);
+});
+// ---- END TEMP DEBUG ----
+
+// ---- TEMP DEBUG — Export DTW debug log as JSON ----
+exportDtwBtn.addEventListener("click", () => {
+  const log = dtwAligner.getDebugLog();
+  if (!log || log.length === 0) {
+    showError("No DTW debug data to export.");
+    return;
+  }
+  downloadJson(`dtw-debug-${Date.now()}.json`, log);
+  showToast(`Exported ${log.length} DTW debug rows`);
+});
+// ---- END TEMP DEBUG ----
 
 // ---- Event wiring ----
 startBtn.addEventListener("click", startCamera);

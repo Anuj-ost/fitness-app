@@ -117,6 +117,15 @@
       <div class="metric-row"><span class="label">Resolution</span><span class="value" id="mRes">—</span></div>
       <div class="metric-row"><span class="label">Inference FPS</span><span class="value accent" id="mFps">—</span></div>
       <div class="metric-row"><span class="label">Landmarks tracked</span><span class="value" id="mCount">0 / 33</span></div>
+      <!-- TEMP DEBUG — pipeline latency meter (remove after verification) -->
+      <div class="metric-row" style="border-top:1px dashed rgba(255,255,255,0.08);margin-top:6px;padding-top:6px;">
+        <span class="label" style="opacity:0.7;">Pipeline Latency</span>
+        <span class="value accent" id="mPipeLatency">—</span>
+      </div>
+      <div class="metric-row">
+        <span class="label" style="opacity:0.7;">Budget Used</span>
+        <span class="value" id="mPipeBudget">—</span>
+      </div>
     </div>
 
     <!-- Camera Calibration -->
@@ -133,6 +142,8 @@
       <div class="metric-row"><span class="label">Status</span><span class="value" id="eStatus">Idle</span></div>
       <div class="metric-row"><span class="label">Sequence Time</span><span class="value" id="eTime">0.0s</span></div>
       <div class="metric-row"><span class="label">Frames Stored</span><span class="value" id="eFrames">0</span></div>
+      <!-- TEMP DEBUG — remove after verification -->
+      <button class="secondary" id="exportRefBtn" style="margin-top:8px;width:100%;font-size:11px;padding:7px 10px;border-style:dashed;opacity:0.7;" disabled>⬇ Export Reference Data (debug)</button>
     </div>
 
     <!-- DTW Alignment & Form Deviation -->
@@ -152,6 +163,8 @@
         <div class="angle-card dev-card"><div class="a-label">L Hip Dev</div><div class="a-value" id="dLHip">—°</div></div>
         <div class="angle-card dev-card"><div class="a-label">R Hip Dev</div><div class="a-value" id="dRHip">—°</div></div>
       </div>
+      <!-- TEMP DEBUG — remove after verification -->
+      <button class="secondary" id="exportDtwBtn" style="margin-top:8px;width:100%;font-size:11px;padding:7px 10px;border-style:dashed;opacity:0.7;" disabled>⬇ Export DTW Debug Data (debug)</button>
     </div>
 
     <!-- Confidence Gauge + Stability -->

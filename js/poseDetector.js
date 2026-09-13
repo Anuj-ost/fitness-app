@@ -101,9 +101,10 @@ export class PoseDetector {
   sendFrame(bitmap, timestamp = performance.now(), meta = null){
     if (!this._loaded || !this._workerIdle){
       bitmap.close();
-      return;
+      return false;
     }
     this._workerIdle = false;
     this._worker.postMessage({ type: "detect", bitmap, timestamp, meta }, [bitmap]);
+    return true;
   }
 }

@@ -1,45 +1,71 @@
 // ============================================================
 // dtwAligner.js
-// Dynamic Time Warping (DTW) Alignment Engine.
-// Aligns live user motion (rolling window) against reference video sequence R(t).
+// Incremental Streaming DTW Engine.
+// Aligns live user pose against reference sequence R(t) using a
+// local-neighborhood search that structurally prevents distant jumps.
 //
 // Features:
-// - Throttled DTW computation (200ms interval / 5Hz)
-// - Sakoe-Chiba band constraint for fast streaming alignment
-// - Primary 8-joint angle RMSE + Secondary 2D normalized coordinate error
-// - Confidence-gated joint exclusion (CONFIDENCE.MEDIUM = 0.4)
-// - Explicit TRACKING_LOST state when K=0 valid joints
+// - Frame-by-frame walk: starts at 0, searches only ± small window.
+// - Pace limiter: caps forward advancement at 2.0x real time.
+// - Rest/Occlusion detection: 4-second rolling window triggers PAUSED.
+// - Primary 8-joint angle RMSE + Secondary 2D normalized coordinate error.
+// - Confidence-gated joint exclusion (CONFIDENCE.MEDIUM = 0.4).
+// - Explicit TRACKING_LOST state when K=0 valid joints.
+// - Capture gap detection.
 // ============================================================
 
 import { CONFIDENCE, JOINT_ANGLES } from "./constants.js";
-import { computeAllJointAngles, calcAngle } from "./angles.js";
+import { computeAllJointAngles } from "./angles.js";
 
 // Key landmark indices used for secondary 2D coordinate distance comparison
 const KEY_COORD_LANDMARKS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]; // shoulders, elbows, wrists, hips, knees, ankles
 
+// Default threshold for detecting capture gaps in reference data (ms)
+const GAP_THRESHOLD_MS = 5000;
+
 export class DTWAligner {
   /**
    * @param {object} [options]
-   * @param {number} [options.windowSize=60] Rolling user frame buffer size (~2 sec at 30fps)
    * @param {number} [options.throttleIntervalMs=200] Recompute throttle interval (ms)
-   * @param {number} [options.lambda=50.0] Scale factor for secondary 2D coord distance (deg / body-unit)
-   * @param {number} [options.bandRadius=15] Sakoe-Chiba band radius (frames)
+   * @param {number} [options.lambda=50.0] Scale factor for secondary 2D coord distance
+   * @param {number} [options.maxPaceRatio=2.0] Max allowed ref time advancement per real time
    */
   constructor(options = {}) {
-    this.windowSize = options.windowSize || 60;
     this.throttleIntervalMs = options.throttleIntervalMs || 200;
     this.lambda = options.lambda !== undefined ? options.lambda : 50.0;
-    this.bandRadius = options.bandRadius || 15;
+    this.gapThresholdMs = GAP_THRESHOLD_MS;
+    
+    // Limits
+    this.backLook = 5;    // frames to look backward (allow small repeated motions)
+    this.forwardLook = 15; // frames to look forward
+    this.maxPaceRatio = options.maxPaceRatio || 2.0;
 
-    this.userBuffer = []; // Rolling array of { landmarks, timestamp, angles, normCoords }
-    this.referenceSequence = null; // Array of reference frame objects
+    this.referenceSequence = null;
     this.calibrationTransform = null;
 
     this.isAligning = false;
     this.lastRecomputeTime = 0;
+    
+    this._refCursor = 0;
+    this.captureGaps = [];
 
-    /** @type {((result: any) => void)|null} Callback invoked when alignment updates */
+    // TEMP DEBUG — per-tick DTW comparison log (cleared on reset/reload)
+    this._debugLog = [];
+    
+    // Callbacks
     this.onAlignmentUpdate = null;
+    this.onCaptureGapsDetected = null;
+    
+    // History buffers for 4-second window (20 frames at 5Hz)
+    this.historyWindowSec = 4.0;
+    this.historyFrames = Math.ceil(this.historyWindowSec / (this.throttleIntervalMs / 1000));
+    
+    this.userAngleHistory = [];
+    this.matchRmseHistory = [];
+    this.paceHistory = [];
+    
+    // "NONE", "POOR_MATCH", "RESTING"
+    this.pauseState = "NONE";
 
     this._lastResult = {
       status: "IDLE",
@@ -52,14 +78,10 @@ export class DTWAligner {
     };
   }
 
-  /**
-   * Load reference sequence R(t) extracted from Phase 3.
-   * Pre-computes joint angles and torso-normalized 2D coordinates for all reference frames.
-   * @param {Array<{timestamp: number, landmarks: Array}>} rawSequence
-   */
   setReferenceSequence(rawSequence) {
     if (!rawSequence || rawSequence.length === 0) {
       this.referenceSequence = null;
+      this.captureGaps = [];
       return;
     }
 
@@ -74,11 +96,46 @@ export class DTWAligner {
         normCoords
       };
     });
+
+    this._detectCaptureGaps();
   }
 
-  /**
-   * Pre-computes 2D torso-centered and normalized coordinates for a reference frame.
-   */
+  _detectCaptureGaps() {
+    this.captureGaps = [];
+    if (!this.referenceSequence || this.referenceSequence.length < 2) return;
+
+    for (let i = 1; i < this.referenceSequence.length; i++) {
+      const prev = this.referenceSequence[i - 1];
+      const curr = this.referenceSequence[i];
+      const delta = curr.timestamp - prev.timestamp;
+
+      if (delta > this.gapThresholdMs) {
+        const gap = {
+          startMs: prev.timestamp,
+          endMs: curr.timestamp,
+          durationMs: Math.round(delta),
+          afterFrameIndex: i - 1,
+          beforeFrameIndex: i
+        };
+        this.captureGaps.push(gap);
+        console.warn(`[Aligner] Capture gap detected: ${(gap.startMs / 1000).toFixed(1)}s → ${(gap.endMs / 1000).toFixed(1)}s`);
+      }
+    }
+
+    if (this.captureGaps.length > 0 && this.onCaptureGapsDetected) {
+      this.onCaptureGapsDetected(this.captureGaps);
+    }
+  }
+
+  _checkGap(timeMs) {
+    for (const gap of this.captureGaps) {
+      if (timeMs >= gap.startMs && timeMs <= gap.endMs) {
+        return { inGap: true, gap };
+      }
+    }
+    return { inGap: false, gap: null };
+  }
+
   _preprocessReferenceCoords(landmarks) {
     if (!landmarks || landmarks.length < 33) return null;
     const lS = landmarks[11], rS = landmarks[12], lH = landmarks[23], rH = landmarks[24];
@@ -115,17 +172,18 @@ export class DTWAligner {
 
   start() {
     this.isAligning = true;
-    this.userBuffer = [];
     this.lastRecomputeTime = 0;
-    this._refCursor = 0;        // Current estimated position in R(t)
-    this._alignStartTime = 0;   // performance.now() when alignment started
+    this._refCursor = 0;
+    
+    this.userAngleHistory = [];
+    this.matchRmseHistory = [];
+    this.paceHistory = [];
+    this.pauseState = "NONE";
   }
 
   stop() {
     this.isAligning = false;
-    this.userBuffer = [];
-    this._refCursor = 0;
-    this._alignStartTime = 0;
+    this._debugLog = [];  // TEMP DEBUG — clear log on session stop
     this._lastResult = {
       status: "IDLE",
       aggregateRmse: null,
@@ -137,232 +195,206 @@ export class DTWAligner {
     };
   }
 
-  /**
-   * Process a single live frame of landmarks.
-   * @param {Array} landmarks
-   * @param {number} timestamp
-   */
   processFrame(landmarks, timestamp = performance.now()) {
     if (!this.isAligning || !this.referenceSequence) return null;
 
-    if (this._alignStartTime === 0) {
-      this._alignStartTime = timestamp;
+    const now = performance.now();
+    if (now - this.lastRecomputeTime < this.throttleIntervalMs) {
+      return this._lastResult;
     }
+    this.lastRecomputeTime = now;
 
     const userAngles = computeAllJointAngles(landmarks);
-
-    // Push into rolling user buffer
-    this.userBuffer.push({
-      timestamp,
-      landmarks,
-      angles: userAngles
-    });
-
-    if (this.userBuffer.length > this.windowSize) {
-      this.userBuffer.shift();
-    }
-
-    // Check throttle timer
-    const now = performance.now();
-    if (now - this.lastRecomputeTime >= this.throttleIntervalMs) {
-      this.lastRecomputeTime = now;
-      const result = this._recomputeAlignment();
-      this._lastResult = result;
-      if (this.onAlignmentUpdate) {
-        this.onAlignmentUpdate(result);
-      }
-      return result;
-    }
-
-    return this._lastResult;
-  }
-
-  /**
-   * Core alignment algorithm — Subsequence DTW.
-   *
-   * Instead of stretching U[0..N-1] across all of R[0..M-1] (which forces
-   * bestJ toward M-1 regardless of real playback position), we maintain a
-   * cursor (_refCursor) tracking our estimated position in R. Each recompute
-   * runs a local DTW of the user buffer against a neighborhood of R around
-   * the cursor, with the user buffer mapped 1:1 (not stretched).
-   *
-   * The search window is:
-   *   R[ max(0, cursor - bandRadius) .. min(M-1, cursor + N + bandRadius) ]
-   *
-   * This means the user's ~2-second rolling window is compared against a
-   * comparable-length slice of R near the cursor, plus padding.  The cursor
-   * advances forward smoothly based on where bestJ lands within that window.
-   */
-  _recomputeAlignment() {
-    if (this.userBuffer.length === 0 || !this.referenceSequence || this.referenceSequence.length === 0) {
-      return {
-        status: "IDLE",
-        aggregateRmse: null,
-        coordDeviation: null,
-        compositeScore: null,
-        matchedRefTime: 0,
-        matchedRefFrame: 0,
-        jointDeviations: {}
-      };
-    }
-
-    const N = this.userBuffer.length;
-    const M = this.referenceSequence.length;
-
-    // Check if current tail user frame is tracking lost (K = 0 valid joints)
-    const latestUserFrame = this.userBuffer[N - 1];
-    const validUserJoints = Object.values(latestUserFrame.angles).filter(j => j.isValid).length;
-
+    const userFrame = { landmarks, angles: userAngles };
+    
+    // Check TRACKING_LOST
+    const validUserJoints = Object.values(userAngles).filter(j => j.isValid).length;
     if (validUserJoints === 0) {
-      return {
+      return this._emitResult({
         status: "TRACKING_LOST",
         aggregateRmse: null,
         coordDeviation: null,
         compositeScore: null,
-        matchedRefTime: 0,
-        matchedRefFrame: 0,
+        matchedRefTime: this.referenceSequence[this._refCursor].timestamp,
+        matchedRefFrame: this._refCursor,
         jointDeviations: this._getEmptyJointDeviations()
-      };
+      });
     }
 
-    // ---- Subsequence DTW against a local neighborhood of R ----
-    // Define the R-window to search: centered on _refCursor, spanning enough
-    // frames to cover the user buffer length plus padding for flexibility.
-    const searchPad = this.bandRadius;
-    const rStart = Math.max(0, this._refCursor - searchPad);
-    const rEnd   = Math.min(M - 1, this._refCursor + N + searchPad);
-    const L      = rEnd - rStart + 1; // length of local R window
-
-    if (L <= 0) {
-      return {
-        status: "OK",
-        aggregateRmse: 0,
-        coordDeviation: 0,
-        compositeScore: 0,
-        matchedRefTime: this.referenceSequence[M - 1].timestamp,
-        matchedRefFrame: M - 1,
-        jointDeviations: this._getEmptyJointDeviations()
-      };
+    // Update angle history for motion variance
+    const extractedAngles = {};
+    for (const key of Object.keys(JOINT_ANGLES)) {
+      extractedAngles[key] = userAngles[key].isValid ? userAngles[key].angle : null;
     }
+    this.userAngleHistory.push(extractedAngles);
+    if (this.userAngleHistory.length > this.historyFrames) this.userAngleHistory.shift();
 
-    // DP table: dp[i][k] = min cumulative cost aligning U[0..i] to R_local[0..k]
-    // where R_local[k] = referenceSequence[rStart + k]
-    const dp = Array.from({ length: N }, () => new Float32Array(L).fill(Infinity));
+    // Calculate motion standard deviation
+    const motionStdev = this._calcUserMotion();
 
-    // Sakoe-Chiba band constraint within the local window.
-    // Map user frame i to an expected R_local position proportionally.
-    const localStepRatio = L / N;
-    const localBandRadius = Math.max(this.bandRadius, Math.ceil(localStepRatio));
-
-    // Initialize first row (i=0)
-    const firstUserFrame = this.userBuffer[0];
-    const maxKFirst = Math.min(L - 1, localBandRadius * 2);
-
-    for (let k = 0; k <= maxKFirst; k++) {
-      const costObj = this._calcFrameDistance(firstUserFrame, this.referenceSequence[rStart + k]);
-      if (costObj !== null) {
-        dp[0][k] = costObj.compositeCost;
+    // Check Pace Limiter
+    let paceRatio = 1.0;
+    if (this.paceHistory.length >= 5) {
+      const oldest = this.paceHistory[0];
+      const newest = this.paceHistory[this.paceHistory.length - 1];
+      const realElapsed = newest.realTimeMs - oldest.realTimeMs;
+      const refElapsed = newest.refTimeMs - oldest.refTimeMs;
+      if (realElapsed > 0) {
+        paceRatio = refElapsed / realElapsed;
       }
     }
 
-    // Fill DP table with band constraint
-    for (let i = 1; i < N; i++) {
-      const uFrame = this.userBuffer[i];
-      const expectedCenter = Math.floor(i * localStepRatio);
-      const minK = Math.max(0, expectedCenter - localBandRadius);
-      const maxK = Math.min(L - 1, expectedCenter + localBandRadius);
+    let forwardSearch = this.forwardLook;
+    let backwardSearch = this.backLook;
+    
+    // Cap advancement if moving too fast through the reference
+    if (paceRatio > this.maxPaceRatio) {
+      forwardSearch = 0;
+    }
+    
+    // Freeze cursor if paused
+    if (this.pauseState !== "NONE") {
+      forwardSearch = 0;
+      backwardSearch = 0;
+    }
 
-      for (let k = minK; k <= maxK; k++) {
-        const costObj = this._calcFrameDistance(uFrame, this.referenceSequence[rStart + k]);
-        if (costObj === null) continue;
+    const M = this.referenceSequence.length;
+    const minK = Math.max(0, this._refCursor - backwardSearch);
+    const maxK = Math.min(M - 1, this._refCursor + forwardSearch);
 
-        // Transitions from (i-1, k), (i-1, k-1), (i, k-1)
-        const cDiag = k > 0 ? dp[i - 1][k - 1] : Infinity;
-        const cUp   = dp[i - 1][k];
-        const cLeft = k > 0 ? dp[i][k - 1] : Infinity;
+    let bestK = this._refCursor;
+    let minCost = Infinity;
+    let bestPairCost = null;
 
-        const minPrev = Math.min(cDiag, cUp, cLeft);
-        if (minPrev !== Infinity) {
-          dp[i][k] = costObj.compositeCost + minPrev;
+    // Local search window
+    for (let k = minK; k <= maxK; k++) {
+      const pairCost = this._calcFrameDistance(userFrame, this.referenceSequence[k]);
+      if (pairCost && pairCost.compositeCost < minCost) {
+        minCost = pairCost.compositeCost;
+        bestK = k;
+        bestPairCost = pairCost;
+      }
+    }
+    
+    if (bestPairCost) {
+      this._refCursor = bestK;
+      this.matchRmseHistory.push(bestPairCost.dAngles);
+      if (this.matchRmseHistory.length > this.historyFrames) this.matchRmseHistory.shift();
+      
+      this.paceHistory.push({ realTimeMs: now, refTimeMs: this.referenceSequence[this._refCursor].timestamp });
+      if (this.paceHistory.length > this.historyFrames) this.paceHistory.shift();
+      
+      // Update Pause State Machine
+      const avgRmse = this.matchRmseHistory.length > 0 ? 
+        this.matchRmseHistory.reduce((a,b)=>a+b, 0) / this.matchRmseHistory.length : 0;
+      
+      const historyFull = this.matchRmseHistory.length >= this.historyFrames;
+
+      if (this.pauseState === "NONE" && historyFull) {
+        if (avgRmse > 40.0) {
+          this.pauseState = "POOR_MATCH";
+        } else if (motionStdev !== Infinity && motionStdev < 3.0) {
+          this.pauseState = "RESTING";
+        }
+      } else if (this.pauseState === "POOR_MATCH") {
+        if (bestPairCost.dAngles < 30.0) {
+          this._clearHistories();
+        }
+      } else if (this.pauseState === "RESTING") {
+        if (motionStdev !== Infinity && motionStdev > 5.0) {
+          this._clearHistories();
         }
       }
     }
 
-    // Find best matching R_local position for U[N-1] (the user's latest frame)
-    let bestK = 0;
-    let minFinalCost = Infinity;
-    const lastExpectedCenter = Math.floor((N - 1) * localStepRatio);
-    const lastMinK = Math.max(0, lastExpectedCenter - localBandRadius);
-    const lastMaxK = Math.min(L - 1, lastExpectedCenter + localBandRadius);
-
-    for (let k = lastMinK; k <= lastMaxK; k++) {
-      if (dp[N - 1][k] < minFinalCost) {
-        minFinalCost = dp[N - 1][k];
-        bestK = k;
-      }
+    // Gap check
+    const matchedRefMs = this.referenceSequence[this._refCursor].timestamp;
+    const gapCheck = this._checkGap(matchedRefMs);
+    let status = this.pauseState !== "NONE" ? "PAUSED" : "OK";
+    if (gapCheck.inGap) status = "REF_GAP";
+    
+    if (Math.random() < 0.1) {
+      console.log(
+        `[Aligner] cursor=${this._refCursor}/${M}, pace=${paceRatio.toFixed(1)}x, RMSE=${bestPairCost ? bestPairCost.dAngles.toFixed(1) : '-'}°, status=${status}`
+      );
     }
 
-    // Convert local index back to global R index
-    let bestJ = rStart + bestK;
-
-    // Fallback if band produced no valid path
-    if (minFinalCost === Infinity) {
-      bestJ = Math.min(M - 1, this._refCursor);
-    }
-
-    // Clamp to valid range
-    bestJ = Math.max(0, Math.min(M - 1, bestJ));
-
-    // ---- Update cursor with smoothing ----
-    // Advance cursor toward bestJ. Use exponential smoothing so the cursor
-    // doesn't jump erratically on a single bad frame, but does track forward
-    // steadily.  The cursor can only move backward a limited amount (to handle
-    // repeated movements) but freely advances forward.
-    const alpha = 0.4; // smoothing factor (0 = ignore new, 1 = snap to new)
-    const smoothed = Math.round(this._refCursor * (1 - alpha) + bestJ * alpha);
-
-    // Allow backward movement up to bandRadius frames (for repeated motions),
-    // but don't let cursor go below 0 or above M-1.
-    const minCursor = Math.max(0, this._refCursor - this.bandRadius);
-    this._refCursor = Math.max(minCursor, Math.min(M - 1, smoothed));
-
-    const matchedRef = this.referenceSequence[bestJ];
-    const finalPairCost = this._calcFrameDistance(latestUserFrame, matchedRef);
-
-    if (!finalPairCost) {
-      return {
+    if (!bestPairCost) {
+      return this._emitResult({
         status: "TRACKING_LOST",
         aggregateRmse: null,
         coordDeviation: null,
         compositeScore: null,
-        matchedRefTime: matchedRef.timestamp,
-        matchedRefFrame: bestJ,
+        matchedRefTime: matchedRefMs,
+        matchedRefFrame: this._refCursor,
         jointDeviations: this._getEmptyJointDeviations()
-      };
+      });
     }
 
-    // Empirical lambda logging for verification
-    if (Math.random() < 0.1) { // 10% sampling of recomputes to avoid console spam
-      console.log(`[DTW Sub-seq] cursor=${this._refCursor}, bestJ=${bestJ}, rStart=${rStart}, rEnd=${rEnd}, D_angles=${finalPairCost.dAngles.toFixed(2)}°`);
+    // ---- TEMP DEBUG — log one row per throttled DTW tick ----
+    const refFrame = this.referenceSequence[this._refCursor];
+    const userAngleObj = {};
+    for (const [id, d] of Object.entries(userAngles)) {
+      userAngleObj[id.substring(1)] = d.isValid ? d.angle : null;
     }
+    const refAngleObj = {};
+    for (const [id, d] of Object.entries(refFrame.angles)) {
+      refAngleObj[id.substring(1)] = d.isValid ? d.angle : null;
+    }
+    this._debugLog.push({
+      userTimeMs:     now,
+      matchedRefTime: matchedRefMs,
+      userAngles:     userAngleObj,
+      refAngles:      refAngleObj,
+      aggregateRmse:  Math.round(bestPairCost.dAngles),
+      bestJ:          this._refCursor,
+      dtwStatus:      status
+    });
+    // ---- END TEMP DEBUG ----
 
-    return {
-      status: "OK",
-      aggregateRmse: Math.round(finalPairCost.dAngles),
-      coordDeviation: parseFloat(finalPairCost.dCoords.toFixed(4)),
-      compositeScore: Math.round(finalPairCost.compositeCost),
-      matchedRefTime: matchedRef.timestamp,
-      matchedRefFrame: bestJ,
-      jointDeviations: finalPairCost.jointDeviations
-    };
+    return this._emitResult({
+      status: status,
+      pauseReason: this.pauseState,
+      aggregateRmse: Math.round(bestPairCost.dAngles),
+      coordDeviation: parseFloat(bestPairCost.dCoords.toFixed(4)),
+      compositeScore: Math.round(bestPairCost.compositeCost),
+      matchedRefTime: matchedRefMs,
+      matchedRefFrame: this._refCursor,
+      jointDeviations: bestPairCost.jointDeviations
+    });
+  }
+  
+  _clearHistories() {
+    this.pauseState = "NONE";
+    this.matchRmseHistory = [];
+    this.userAngleHistory = [];
+    this.paceHistory = [];
   }
 
-  /**
-   * Calculates distance between a user frame and reference frame.
-   * Primary: 8 Joint Angle RMSE (in degrees).
-   * Secondary: Mean normalized 2D coordinate distance (in torso-normalized body height units).
-   * @returns {{dAngles: number, dCoords: number, compositeCost: number, jointDeviations: Record<string, {deviation: number|null, isValid: boolean}>}|null}
-   */
+  _calcUserMotion() {
+    if (this.userAngleHistory.length < 5) return Infinity; 
+    
+    let totalVar = 0;
+    let validJoints = 0;
+    
+    for (const jointId of Object.keys(JOINT_ANGLES)) {
+      const vals = this.userAngleHistory.map(h => h[jointId]).filter(v => v !== null);
+      if (vals.length > this.userAngleHistory.length * 0.5) {
+        const mean = vals.reduce((a,b) => a+b, 0) / vals.length;
+        const variance = vals.reduce((a,b) => a + Math.pow(b - mean, 2), 0) / vals.length;
+        totalVar += Math.sqrt(variance);
+        validJoints++;
+      }
+    }
+    return validJoints > 0 ? (totalVar / validJoints) : Infinity;
+  }
+
+  _emitResult(result) {
+    this._lastResult = result;
+    if (this.onAlignmentUpdate) this.onAlignmentUpdate(result);
+    return result;
+  }
+
   _calcFrameDistance(userFrame, refFrame) {
     const uAngles = userFrame.angles;
     const rAngles = refFrame.angles;
@@ -383,11 +415,10 @@ export class DTWAligner {
       }
     }
 
-    if (validJointCount === 0) return null; // K = 0
+    if (validJointCount === 0) return null;
 
     const dAngles = Math.sqrt(sumSqAngleErr / validJointCount);
 
-    // Secondary parameter: Normalized 2D coordinate mean Euclidean distance
     let sumCoordDist = 0;
     let validCoordCount = 0;
 
@@ -397,7 +428,6 @@ export class DTWAligner {
         const normalizedLandmarks = this.calibrationTransform.normalizeLandmarks(userFrame.landmarks);
         uNormCoords = KEY_COORD_LANDMARKS.map(idx => normalizedLandmarks[idx]);
       } else {
-        // Uncalibrated fallback: torso-centered scaling
         const uLms = userFrame.landmarks;
         const lS = uLms[11], rS = uLms[12], lH = uLms[23], rH = uLms[24];
         if (lS && rS && lH && rH) {
@@ -438,12 +468,7 @@ export class DTWAligner {
     const dCoords = validCoordCount > 0 ? sumCoordDist / validCoordCount : 0;
     const compositeCost = dAngles + (this.lambda * dCoords);
 
-    return {
-      dAngles,
-      dCoords,
-      compositeCost,
-      jointDeviations
-    };
+    return { dAngles, dCoords, compositeCost, jointDeviations };
   }
 
   _getEmptyJointDeviations() {
@@ -453,4 +478,12 @@ export class DTWAligner {
     }
     return res;
   }
+
+  // ---- TEMP DEBUG — debug log accessors ----
+  /** @returns {Array} shallow copy of the accumulated debug log */
+  getDebugLog() { return this._debugLog.slice(); }
+
+  /** Clears the debug log (called on session reset). */
+  resetDebugLog() { this._debugLog = []; }
+  // ---- END TEMP DEBUG ----
 }
